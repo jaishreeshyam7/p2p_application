@@ -14,7 +14,7 @@ const InsightEngineApp = () => {
   // Real-time Analytics from Backend
   const [analytics, setAnalytics] = useState({
     hr: 0,
-    dominant_emotion: 'Neutral',
+    dominant_emotion: 'Neutral'  ,
     emotions: {
       'Happiness/Joy': 0,
       'Trust': 0,
