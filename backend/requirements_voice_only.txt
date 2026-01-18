@@ -1,0 +1,21 @@
+# Voice-Only Backend Dependencies (No CV/Video Libraries)
+
+# Web Framework
+flask==3.0.0
+flask-socketio==5.3.6
+flask-cors==4.0.0
+
+# WebSocket Support
+python-socketio==5.11.0
+python-engineio==4.9.0
+
+# Async Support
+eventlet==0.35.2
+
+# For future speech recognition integration (optional)
+# SpeechRecognition==3.10.1
+# pydub==0.25.1
+
+# For future AI enhancements (optional)
+# openai==1.12.0
+# anthropic==0.18.0
