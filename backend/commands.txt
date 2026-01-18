@@ -1,0 +1,7 @@
+backend:
+cd backend
+python app.py
+
+frontend:
+cd /workspaces/p2p_application/frontend
+npm start
