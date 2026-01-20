@@ -1,413 +1,460 @@
-"""Voice-Focused P2P Backend with Audio Analysis"""
-
 import os
 import time
-import base64
+import random
 import threading
 from collections import deque
-from flask import Flask, send_from_directory, request, jsonify
-from flask_socketio import SocketIO, emit
+from flask import Flask, send_from_directory, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 
-# === AUDIO PIPELINE IMPORTS (Optional - with fallback) ===
+# === SAFE IMPORTS FOR CV/ML ===
 try:
+    import cv2
     import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
-    print("⚠️ NumPy not available - some audio features disabled")
+    import mediapipe as mp
+    from scipy.signal import butter, filtfilt, find_peaks
+    LIBRARIES_AVAILABLE = True
+    print("✅ CV/ML libraries loaded successfully.")
+except ImportError as e:
+    LIBRARIES_AVAILABLE = False
+    print(f"⚠️ CV/ML LIBRARY MISSING: {e}")
 
-# Try importing audio processing libraries
+# === DEEPFACE IMPORT (OPTIONAL) ===
 try:
-    import whisper
-    WHISPER_AVAILABLE = True
-    print("✅ Whisper loaded for speech-to-text")
-except ImportError:
-    WHISPER_AVAILABLE = False
-    print("⚠️ Whisper not available - using browser speech recognition")
+    from deepface import DeepFace
+    DEEPFACE_AVAILABLE = True
+    print("✅ DeepFace loaded successfully.")
+except ImportError as e:
+    DEEPFACE_AVAILABLE = False
+    print(f"⚠️ DeepFace not available: {e}")
+    print("💡 Using geometric emotion detection as fallback.")
+
+# === AUDIO PIPELINE IMPORTS ===
+try:
+    from audio_pipeline.transcribe_whisper import transcribe_audio_stream
+    from audio_pipeline.text_emotion_distilbert import analyze_text_emotion
+    from audio_pipeline.objections_spacy import detect_objections
+    AUDIO_PIPELINE_AVAILABLE = True
+    print("✅ Audio pipeline modules loaded successfully.")
+except ImportError as e:
+    AUDIO_PIPELINE_AVAILABLE = False
+    print(f"⚠️ Audio pipeline not available: {e}")
+    print("💡 Using basic text processing as fallback.")
 
 # --- CONFIGURATION ---
 app = Flask(__name__, static_folder='../frontend/build', static_url_path='')
 CORS(app, resources={r"/*": {"origins": "*"}})
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', max_http_buffer_size=10000000)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60, ping_interval=25)
 
-# --- VOICE ANALYZER CLASS ---
-class VoiceAnalyzer:
-    """Analyzes voice conversations with emotion detection and coaching"""
-    
+class RobustAnalyzer:
     def __init__(self):
-        self.transcript_buffer = deque(maxlen=100)
-        self.session_data = {}
-        self.current_session = None
-        self.audio_buffer = deque(maxlen=30)  # Store recent audio chunks
+        self.fs = 30
+        self.buffer = deque(maxlen=self.fs * 10)
+        self.signal_buffer = deque(maxlen=self.fs * 10)
+        self.running = False
+        self.use_deepface = DEEPFACE_AVAILABLE
         
-        # Load Whisper model if available
-        if WHISPER_AVAILABLE:
+        # Initialize CV/ML components if available
+        if LIBRARIES_AVAILABLE:
             try:
-                self.whisper_model = whisper.load_model("base")
-                print("✅ Whisper model loaded (base)")
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.face_mesh = self.mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=False,
+                    min_detection_confidence=0.6,
+                    min_tracking_confidence=0.6
+                )
+                print(f"✅ MediaPipe Face Mesh initialized")
+                print(f"🎭 Emotion Detection: {'DeepFace (AI-powered)' if self.use_deepface else 'Geometric (Fallback)'}")
             except Exception as e:
-                self.whisper_model = None
-                print(f"⚠️ Whisper model loading failed: {e}")
+                print(f"⚠️ MediaPipe initialization failed: {e}")
+                self.face_mesh = None
         else:
-            self.whisper_model = None
+            self.face_mesh = None
         
-        # Emotion keywords for text-based emotion detection
-        self.emotion_keywords = {
-            'Happiness/Joy': ['happy', 'great', 'excellent', 'wonderful', 'excited', 'love', 'perfect', 'amazing', 'fantastic', 'glad'],
-            'Trust': ['agree', 'confident', 'reliable', 'sure', 'believe', 'trust', 'yes', 'definitely', 'absolutely', 'certain'],
-            'Fear/FOMO': ['worried', 'concerned', 'anxious', 'scared', 'nervous', 'uncertain', 'doubt', 'afraid', 'risky'],
-            'Surprise': ['wow', 'unexpected', 'amazing', 'surprised', 'shocked', 'really', 'incredible', 'unbelievable'],
-            'Anger': ['angry', 'frustrated', 'annoyed', 'upset', 'irritated', 'disappointed', 'furious', 'mad'],
+        # Current analysis values
+        self.current_hr = 70
+        self.current_emotion = "Neutral"
+        self.current_emotions = {
+            'Happiness/Joy': 0,
+            'Trust': 50,
+            'Fear/FOMO': 0,
+            'Surprise': 0,
+            'Anger': 0
         }
+        self.gaze_x = 50
+        self.gaze_y = 50
         
-        # Objection detection patterns
-        self.objection_patterns = {
-            'price': ['expensive', 'costly', 'price', 'afford', 'budget', 'too much', 'money', 'cost'],
-            'timing': ['think about it', 'later', 'not now', 'maybe next time', 'get back to you', 'need time'],
-            'authority': ['need to check', 'ask my boss', 'discuss with team', 'talk to', 'consult'],
-            'need': ["don't need", 'not sure', 'not interested', 'no thanks', 'not necessary', 'already have'],
-            'competition': ['competitor', 'other options', 'looking at others', 'comparing', 'alternative']
-        }
-        
-        # Sarcasm indicators
-        self.sarcasm_indicators = [
-            'yeah right', 'sure thing', 'oh great', 'fantastic', 'wonderful',
-            'obviously', 'clearly', 'of course'
-        ]
-        
-        # Hesitation words
-        self.hesitation_words = [
-            'um', 'uh', 'hmm', 'well', 'actually', 'basically', 'kind of',
-            'sort of', 'i guess', 'maybe', 'perhaps', 'you know'
-        ]
+        # DeepFace processing optimization
+        self.last_deepface_time = 0
+        self.deepface_interval = 0.5
     
-    # === AUDIO PROCESSING ===
-    def process_audio_chunk(self, audio_data):
-        """Process incoming audio chunk with Whisper"""
-        if not self.whisper_model or not NUMPY_AVAILABLE:
+    def bandpass_filter(self, signal, fs=30, low=0.7, high=3.5):
+        try:
+            nyquist = fs / 2
+            low_norm = low / nyquist
+            high_norm = high / nyquist
+            if low_norm >= 1 or high_norm >= 1:
+                return signal
+            b, a = butter(3, [low_norm, high_norm], btype="band")
+            return filtfilt(b, a, signal)
+        except:
+            return signal
+    
+    def calculate_heart_rate(self, signal):
+        if len(signal) < self.fs * 6:
             return None
+        try:
+            sig_array = np.array(signal)
+            sig_array = sig_array - np.mean(sig_array)
+            std_val = np.std(sig_array)
+            if std_val == 0:
+                return None
+            sig_array = sig_array / std_val
+            filtered = self.bandpass_filter(sig_array, self.fs)
+            prominence = np.std(filtered) * 0.3
+            peaks, _ = find_peaks(filtered, distance=self.fs//2, prominence=prominence)
+            if len(peaks) >= 4:
+                intervals = np.diff(peaks) / self.fs
+                q1, q3 = np.percentile(intervals, [25, 75])
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+                valid_intervals = intervals[(intervals >= lower_bound) & (intervals <= upper_bound)]
+                if len(valid_intervals) >= 2:
+                    hr = 60.0 / np.mean(valid_intervals)
+                    return int(hr) if 45 <= hr <= 160 else None
+        except Exception as e:
+            print(f"HR calculation error: {e}")
+        return None
+    
+    def extract_roi_signal(self, frame_rgb, landmarks):
+        try:
+            h, w = frame_rgb.shape[:2]
+            rois = [
+                (landmarks.landmark[10].x, landmarks.landmark[10].y - 0.04, 20),
+                (landmarks.landmark[234].x, landmarks.landmark[234].y, 15),
+                (landmarks.landmark[454].x, landmarks.landmark[454].y, 15)
+            ]
+            signals = []
+            for x_norm, y_norm, size in rois:
+                cx, cy = int(x_norm * w), int(y_norm * h)
+                x1, y1 = max(0, cx - size), max(0, cy - size)
+                x2, y2 = min(w, cx + size), min(h, cy + size)
+                if x2 > x1 and y2 > y1:
+                    roi = frame_rgb[y1:y2, x1:x2, 1]
+                    if roi.size > 100:
+                        signals.append(np.mean(roi))
+            return np.mean(signals) if signals else None
+        except:
+            return None
+    
+    def analyze_emotions_deepface(self, frame_rgb):
+        try:
+            small_frame = cv2.resize(frame_rgb, (224, 224))
+            result = DeepFace.analyze(small_frame, actions=['emotion'], enforce_detection=False, silent=True)
+            deepface_emotions = result[0]['emotion']
+            emotions = {
+                'Happiness/Joy': int(deepface_emotions.get('happy', 0)),
+                'Trust': 100 - int(deepface_emotions.get('fear', 0) + deepface_emotions.get('angry', 0)) // 2,
+                'Fear/FOMO': int(deepface_emotions.get('fear', 0)),
+                'Surprise': int(deepface_emotions.get('surprise', 0)),
+                'Anger': int(deepface_emotions.get('angry', 0))
+            }
+            emotions['Trust'] = max(10, min(90, emotions['Trust']))
+            dominant = max(emotions.items(), key=lambda x: x[1])
+            dominant_name = dominant[0] if dominant[1] > 30 else "Neutral"
+            return emotions, dominant_name
+        except Exception as e:
+            print(f"DeepFace error: {e}")
+            return None, None
+    
+    def detect_emotions_geometric(self, frame, face_landmarks):
+        emotions = {
+            'Happiness/Joy': 0,
+            'Trust': 50,
+            'Fear/FOMO': 0,
+            'Surprise': 0,
+            'Anger': 0
+        }
+        try:
+            h, w = frame.shape[:2]
+            left_mouth = face_landmarks.landmark[61]
+            right_mouth = face_landmarks.landmark[291]
+            upper_lip = face_landmarks.landmark[13]
+            lower_lip = face_landmarks.landmark[14]
+            left_eye = face_landmarks.landmark[33]
+            right_eye = face_landmarks.landmark[263]
+            left_eyebrow = face_landmarks.landmark[70]
+            right_eyebrow = face_landmarks.landmark[300]
+            
+            mouth_width = abs(right_mouth.x - left_mouth.x) * w
+            mouth_height = abs(upper_lip.y - lower_lip.y) * h
+            mouth_curve = (left_mouth.y + right_mouth.y) / 2 - upper_lip.y
+            eye_openness = abs(left_eye.y - left_eyebrow.y) + abs(right_eye.y - right_eyebrow.y)
+            
+            if mouth_width > 25 and mouth_curve < -0.01:
+                emotions['Happiness/Joy'] = min(100, int(mouth_width * 2))
+                emotions['Trust'] = 70
+                dominant = "Happiness/Joy"
+            elif eye_openness > 0.06 and mouth_height > 8:
+                emotions['Surprise'] = min(100, int(eye_openness * 1000))
+                emotions['Trust'] = 30
+                dominant = "Surprise"
+            elif eye_openness < 0.03 and mouth_width < 15:
+                if mouth_curve > 0.005:
+                    emotions['Anger'] = 60
+                    emotions['Trust'] = 10
+                    dominant = "Anger"
+                else:
+                    emotions['Fear/FOMO'] = 50
+                    emotions['Trust'] = 20
+                    dominant = "Fear/FOMO"
+            else:
+                emotions['Trust'] = 60
+                dominant = "Trust"
+            return emotions, dominant
+        except Exception as e:
+            print(f"Emotion detection error: {e}")
+            return emotions, "Neutral"
+    
+    def calculate_gaze(self, landmarks):
+        try:
+            left_eye = landmarks.landmark[33]
+            right_eye = landmarks.landmark[263]
+            gaze_x = ((left_eye.x + right_eye.x) / 2) * 100
+            gaze_y = ((left_eye.y + right_eye.y) / 2) * 100
+            return gaze_x, gaze_y
+        except:
+            return 50, 50
+    
+    def stream_webcam_analysis(self):
+        print("🎥 Starting real-time webcam analysis...")
+        self.running = True
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("⚠️ Camera not accessible, falling back to simulation")
+            self.stream_simulation()
+            return
+        
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        frame_count = 0
+        last_hr_time = time.time()
         
         try:
-            # Convert base64 to numpy array if needed
-            if isinstance(audio_data, str):
-                audio_bytes = base64.b64decode(audio_data)
-                audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-            else:
-                audio_array = audio_data
-            
-            # Store in buffer
-            self.audio_buffer.append(audio_array)
-            
-            # Transcribe with Whisper
-            result = self.whisper_model.transcribe(audio_array)
-            return result['text']
-            
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                current_time = time.time()
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.face_mesh.process(frame_rgb)
+                
+                if results.multi_face_landmarks:
+                    landmarks = results.multi_face_landmarks[0]
+                    
+                    if frame_count % 3 == 0:
+                        if self.use_deepface and (current_time - self.last_deepface_time) >= self.deepface_interval:
+                            emotions, dominant = self.analyze_emotions_deepface(frame_rgb)
+                            if emotions is not None:
+                                self.current_emotions = emotions
+                                self.current_emotion = dominant
+                                self.last_deepface_time = current_time
+                            else:
+                                emotions, dominant = self.detect_emotions_geometric(frame_rgb, landmarks)
+                                self.current_emotions = emotions
+                                self.current_emotion = dominant
+                        else:
+                            emotions, dominant = self.detect_emotions_geometric(frame_rgb, landmarks)
+                            self.current_emotions = emotions
+                            self.current_emotion = dominant
+                    
+                    if frame_count % 2 == 0:
+                        roi_signal = self.extract_roi_signal(frame_rgb, landmarks)
+                        if roi_signal is not None:
+                            self.signal_buffer.append(roi_signal)
+                    
+                    if time.time() - last_hr_time >= 1.5 and len(self.signal_buffer) >= self.fs * 6:
+                        hr = self.calculate_heart_rate(self.signal_buffer)
+                        if hr is not None:
+                            self.current_hr = hr
+                        last_hr_time = time.time()
+                    
+                    self.gaze_x, self.gaze_y = self.calculate_gaze(landmarks)
+                
+                data = {
+                    "hr": self.current_hr,
+                    "dominant_emotion": self.current_emotion,
+                    "emotions": self.current_emotions,
+                    "gaze_x": self.gaze_x,
+                    "gaze_y": self.gaze_y
+                }
+                socketio.emit('server_update', data)
+                frame_count += 1
+                time.sleep(0.033)
         except Exception as e:
-            print(f"⚠️ Audio processing error: {e}")
-            return None
+            print(f"❌ Webcam analysis error: {e}")
+        finally:
+            cap.release()
+            if self.face_mesh:
+                self.face_mesh.close()
     
-    # === EMOTION ANALYSIS FROM TEXT ===
-    def analyze_emotions_from_text(self, text: str) -> dict:
-        """Detect emotions from transcript text"""
-        if not text:
-            return self._neutral_emotions()
-        
-        text_lower = text.lower()
-        emotion_scores = {emotion: 0 for emotion in self.emotion_keywords}
-        
-        # Count emotion keywords
-        for emotion, keywords in self.emotion_keywords.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    emotion_scores[emotion] += 10
-        
-        # Normalize scores to 0-100
-        total = sum(emotion_scores.values())
-        if total > 0:
-            emotion_scores = {k: min(100, int((v / total) * 100)) for k, v in emotion_scores.items()}
+    def stream_simulation(self):
+        print("🚀 SIMULATION STREAM STARTED")
+        self.running = True
+        while self.running:
+            try:
+                data = {
+                    "hr": 70 + random.randint(-5, 10),
+                    "dominant_emotion": random.choice(["Happiness/Joy", "Trust", "Neutral", "Surprise", "Anger"]),
+                    "emotions": {
+                        'Happiness/Joy': random.randint(30, 90),
+                        'Trust': random.randint(40, 85),
+                        'Fear/FOMO': random.randint(0, 30),
+                        'Surprise': random.randint(10, 50),
+                        'Anger': random.randint(0, 25)
+                    },
+                    "gaze_x": 50 + random.randint(-30, 30),
+                    "gaze_y": 50 + random.randint(-10, 10)
+                }
+                socketio.emit('server_update', data)
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"❌ Error in simulation: {e}")
+                time.sleep(1.0)
+    
+    def run(self):
+        if LIBRARIES_AVAILABLE and self.face_mesh is not None:
+            try:
+                self.stream_webcam_analysis()
+            except Exception as e:
+                print(f"❌ Failed to start webcam: {e}")
+                self.stream_simulation()
         else:
-            emotion_scores = self._neutral_emotions()
-        
-        # Ensure Trust baseline
-        if all(v < 20 for v in emotion_scores.values()):
-            emotion_scores['Trust'] = 50
-        
-        # Find dominant emotion
-        dominant = max(emotion_scores.items(), key=lambda x: x[1])
-        dominant_name = dominant[0] if dominant[1] > 30 else "Trust"
-        
-        return {
-            'emotions': emotion_scores,
-            'dominant_emotion': dominant_name
-        }
+            self.stream_simulation()
     
-    def _neutral_emotions(self) -> dict:
-        """Return neutral emotion baseline"""
-        return {
-            'Happiness/Joy': 20,
-            'Trust': 50,
-            'Fear/FOMO': 10,
-            'Surprise': 10,
-            'Anger': 10
-        }
-    
-    # === OBJECTION DETECTION ===
-    def detect_objection(self, text: str) -> dict:
-        """Detect sales objections in conversation"""
-        text_lower = text.lower()
-        
-        for objection_type, keywords in self.objection_patterns.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    suggestions = self._get_objection_suggestion(objection_type)
-                    return {
-                        'detected': True,
-                        'type': objection_type,
-                        'keyword': keyword,
-                        'text': text,
-                        'suggestion': suggestions,
-                        'timestamp': time.time()
-                    }
-        
-        return {'detected': False}
-    
-    def _get_objection_suggestion(self, objection_type: str) -> str:
-        """Get coaching suggestion for objection type"""
-        suggestions = {
-            'price': "💰 Price objection detected. Focus on value and ROI. Ask: 'What would you compare this investment to?'",
-            'timing': "⏰ Timing objection. Create urgency: 'What would need to change for you to move forward today?'",
-            'authority': "👔 Authority objection. Ask: 'Who else should be part of this conversation?'",
-            'need': "🤔 Need objection. Dig deeper: 'What are your current challenges in this area?'",
-            'competition': "🏆 Competition objection. Differentiate: 'What's most important to you in a solution?'"
-        }
-        return suggestions.get(objection_type, "Address the concern directly.")
-    
-    # === TONE ANALYSIS ===
-    def analyze_tone(self, text: str) -> dict:
-        """Analyze tone, sarcasm, confidence"""
-        text_lower = text.lower()
-        
-        # Sarcasm detection
-        sarcasm_score = sum(1 for indicator in self.sarcasm_indicators if indicator in text_lower) * 30
-        sarcasm_score = min(100, sarcasm_score)
-        
-        # Confidence level (inverse of hesitation)
-        words = text.split()
-        word_count = len(words)
-        hesitation_count = sum(1 for word in words if word.lower() in self.hesitation_words)
-        hesitation_ratio = hesitation_count / word_count if word_count > 0 else 0
-        confidence_score = max(0, int(100 - (hesitation_ratio * 200)))
-        
-        # Sentiment
-        positive_words = ['great', 'excellent', 'amazing', 'love', 'perfect', 'wonderful', 'good', 'happy']
-        negative_words = ['bad', 'terrible', 'awful', 'horrible', 'worst', 'hate', 'poor', 'disappointed']
-        
-        positive_count = sum(1 for word in positive_words if word in text_lower)
-        negative_count = sum(1 for word in negative_words if word in text_lower)
-        
-        if positive_count > negative_count:
-            sentiment = 'positive'
-        elif negative_count > positive_count:
-            sentiment = 'negative'
-        else:
-            sentiment = 'neutral'
-        
-        return {
-            'sarcasm_score': sarcasm_score,
-            'confidence_score': confidence_score,
-            'sentiment': sentiment,
-            'hesitation_ratio': round(hesitation_ratio, 3)
-        }
-    
-    # === CONVERSATION ANALYTICS ===
-    def add_transcript(self, text: str, speaker: str) -> dict:
-        """Add transcript entry with metadata"""
-        timestamp = time.time()
-        words = text.split()
-        word_count = len(words)
-        
-        entry = {
-            'text': text,
-            'speaker': speaker,
-            'timestamp': timestamp,
-            'word_count': word_count
-        }
-        
-        self.transcript_buffer.append(entry)
-        return entry
-    
-    def get_conversation_balance(self) -> dict:
-        """Analyze conversation balance between speakers"""
-        if not self.transcript_buffer:
-            return {'user_percentage': 50, 'prospect_percentage': 50, 'recommendation': 'No data yet'}
-        
-        user_entries = [t for t in self.transcript_buffer if t['speaker'] == 'user']
-        prospect_entries = [t for t in self.transcript_buffer if t['speaker'] == 'prospect']
-        
-        user_words = sum(t['word_count'] for t in user_entries)
-        prospect_words = sum(t['word_count'] for t in prospect_entries)
-        
-        total_words = user_words + prospect_words
-        
-        if total_words == 0:
-            return {'user_percentage': 50, 'prospect_percentage': 50, 'recommendation': 'Start speaking'}
-        
-        user_percentage = round((user_words / total_words) * 100, 1)
-        prospect_percentage = round((prospect_words / total_words) * 100, 1)
-        
-        # Generate recommendation
-        if user_percentage > 70:
-            recommendation = "🗣️ You're talking too much. Let the prospect speak more."
-        elif user_percentage < 30:
-            recommendation = "🤫 Prospect is dominating. Ask more guiding questions."
-        else:
-            recommendation = "✅ Good conversation balance!"
-        
-        return {
-            'user_percentage': user_percentage,
-            'prospect_percentage': prospect_percentage,
-            'user_words': user_words,
-            'prospect_words': prospect_words,
-            'recommendation': recommendation
-        }
-    
-    # === COMPREHENSIVE ANALYSIS ===
-    def analyze_comprehensive(self, text: str, speaker: str) -> dict:
-        """Run all analyses together"""
-        # Add to transcript buffer
-        transcript_entry = self.add_transcript(text, speaker)
-        
-        # Emotion analysis
-        emotion_data = self.analyze_emotions_from_text(text)
-        
-        # Objection detection
-        objection_data = self.detect_objection(text)
-        
-        # Tone analysis
-        tone_data = self.analyze_tone(text)
-        
-        # Conversation metrics
-        balance = self.get_conversation_balance()
-        
-        return {
-            'transcript': transcript_entry,
-            'emotions': emotion_data['emotions'],
-            'dominant_emotion': emotion_data['dominant_emotion'],
-            'objection': objection_data,
-            'tone': tone_data,
-            'conversation_balance': balance,
-            'timestamp': time.time()
-        }
+    def stop(self):
+        self.running = False
 
-# --- GLOBAL ANALYZER ---
-analyzer = VoiceAnalyzer()
+analyzer = RobustAnalyzer()
 
-# --- SOCKET EVENTS ---
+# === TEXT ANALYSIS ===
+def analyze_text_with_pipeline(text):
+    results = {'emotions': {}, 'objections': [], 'sentiment': 'neutral'}
+    if AUDIO_PIPELINE_AVAILABLE:
+        try:
+            results['emotions'] = analyze_text_emotion(text)
+            results['objections'] = detect_objections(text)
+        except Exception as e:
+            print(f"❌ Text analysis error: {e}")
+    else:
+        objection_keywords = ['expensive', 'costly', 'think about it', 'not sure', 'too much', 'budget']
+        results['objections'] = [word for word in objection_keywords if word in text.lower()]
+    return results
+
+# === SOCKET EVENTS ===
 @socketio.on('connect')
 def handle_connect():
     try:
         print(f'✅ Client connected: {request.sid}')
-        emit('connection_status', {'status': 'connected', 'mode': 'voice-focused'})
+        emit('connection_status', {'status': 'connected', 'sid': request.sid})
     except Exception as e:
-        print(f'❌ Error in connect handler: {e}')
+        print(f'❌ Error in connect: {e}')
 
 @socketio.on('disconnect')
 def handle_disconnect():
     try:
         print(f'❌ Client disconnected: {request.sid}')
     except Exception as e:
-        print(f'❌ Error in disconnect handler: {e}')
+        print(f'❌ Error in disconnect: {e}')
 
 @socketio.on('identify')
 def handle_identify(data):
     try:
         print(f'👤 User identified: {data}')
-        time.sleep(1)
-        emit('match-found', {'roomId': 'room-voice-1', 'timestamp': time.time()})
+        user_type = data.get('type', 'user')
+        time.sleep(2)
+        room_id = f'room-{user_type}-{int(time.time())}'
+        join_room(room_id)
+        emit('match-found', {'roomId': room_id, 'timestamp': time.time(), 'status': 'success'})
+        print(f'🎯 Match created: {room_id}')
     except Exception as e:
-        print(f'❌ Error in identify handler: {e}')
-        emit('error', {'message': 'Failed to identify user'})
+        print(f'❌ Error in identify: {e}')
+        emit('error', {'message': 'Failed to identify user', 'error': str(e)})
 
 @socketio.on('transcript')
 def handle_transcript(data):
-    """Handle incoming transcript from speech recognition"""
     try:
+        print(f'📝 Transcript: {data}')
+        speaker = data.get('speaker', 'unknown')
         text = data.get('text', '')
-        speaker = data.get('speaker', 'user')
         
-        print(f'📝 [{speaker}]: {text}')
+        analysis = analyze_text_with_pipeline(text)
         
-        # Run comprehensive analysis
-        analysis = analyzer.analyze_comprehensive(text, speaker)
-        
-        # Send real-time emotion update
-        socketio.emit('server_update', {
-            'hr': 70,  # Placeholder - can be integrated with wearables
-            'dominant_emotion': analysis['dominant_emotion'],
-            'emotions': analysis['emotions'],
-            'gaze_x': 50,
-            'gaze_y': 50
-        })
-        
-        # Send detailed analysis
-        emit('analysis_result', analysis)
-        
-        # If objection detected, send immediate alert
-        if analysis['objection']['detected']:
+        if analysis['objections']:
+            objection_text = ', '.join(analysis['objections'])
+            suggestion = f"💡 Objection detected: '{objection_text}'. Consider addressing value proposition."
             emit('ai-response', {
-                'suggestion': analysis['objection']['suggestion'],
-                'type': 'objection'
-            })
-            emit('objection_alert', {
-                'type': analysis['objection']['type'],
-                'suggestion': analysis['objection']['suggestion']
+                'suggestion': suggestion, 
+                'type': 'objection',
+                'objections': analysis['objections'],
+                'timestamp': time.time()
             })
         
+        if analysis['emotions']:
+            emit('text-emotion-update', {
+                'emotions': analysis['emotions'],
+                'text': text,
+                'timestamp': time.time()
+            })
     except Exception as e:
-        print(f'❌ Error processing transcript: {e}')
-        emit('error', {'message': str(e)})
-
-@socketio.on('audio-chunk')
-def handle_audio_chunk(data):
-    """Handle raw audio data for Whisper transcription"""
-    try:
-        audio_data = data.get('audio', None)
-        if audio_data and analyzer.whisper_model:
-            text = analyzer.process_audio_chunk(audio_data)
-            if text:
-                # Process the transcribed text
-                handle_transcript({'text': text, 'speaker': 'user'})
-    except Exception as e:
-        print(f'❌ Error processing audio: {e}')
+        print(f'❌ Error in transcript: {e}')
+        emit('error', {'message': 'Failed to process transcript', 'error': str(e)})
 
 @socketio.on('analyze-context')
 def handle_analysis(data):
     try:
-        print(f'🔍 Analysis requested: {data}')
+        print(f'🔍 Analysis requested')
         transcript = data.get('transcript', '')
         emotions = data.get('emotions', {})
+        hr = data.get('hr', 0)
         
         suggestions = []
         
-        # Analyze based on emotion levels
+        if hr > 80:
+            suggestions.append("⚡ High heart rate detected. Prospect may be stressed or excited.")
+        elif hr > 0 and hr < 60:
+            suggestions.append("😌 Low heart rate. Prospect appears calm.")
+        
         trust_level = emotions.get('Trust', 0)
         if trust_level > 60:
             suggestions.append("✅ Strong trust signals. Good time to move toward commitment.")
         elif trust_level < 30:
-            suggestions.append("⚠️ Low trust detected. Focus on building rapport and credibility.")
+            suggestions.append("⚠️ Low trust. Focus on building rapport.")
         
         anger_level = emotions.get('Anger', 0)
         if anger_level > 40:
-            suggestions.append("🚨 Frustration detected. Consider active listening and empathy.")
+            suggestions.append("🚨 Frustration detected. Consider active listening.")
         
-        # Get conversation balance
-        balance = analyzer.get_conversation_balance()
-        suggestions.append(balance['recommendation'])
+        fear_level = emotions.get('Fear/FOMO', 0)
+        if fear_level > 40:
+            suggestions.append("😰 Anxiety detected. Provide reassurance.")
+        
+        joy_level = emotions.get('Happiness/Joy', 0)
+        if joy_level > 60:
+            suggestions.append("😊 Positive engagement! Continue current approach.")
+        
+        if transcript:
+            text_analysis = analyze_text_with_pipeline(transcript)
+            if text_analysis['objections']:
+                suggestions.append(f"📋 Concerns: {', '.join(text_analysis['objections'])}")
         
         if not suggestions:
-            suggestions.append("📊 Conversation flow is normal. Continue with current approach.")
+            suggestions.append("📊 Conversation flow is normal.")
         
         emit('ai-response', {
             'suggestion': ' '.join(suggestions),
@@ -415,51 +462,43 @@ def handle_analysis(data):
             'timestamp': time.time()
         })
     except Exception as e:
-        print(f'❌ Error in analysis handler: {e}')
-        emit('error', {'message': 'Failed to analyze context'})
+        print(f'❌ Error in analysis: {e}')
+        emit('error', {'message': 'Failed to analyze', 'error': str(e)})
 
 @socketio.on('session-started')
 def handle_session_start(data):
     try:
-        session_id = data.get('roomId', f'session_{int(time.time())}')
-        analyzer.current_session = session_id
-        analyzer.transcript_buffer.clear()
-        print(f'🎬 Session started: {session_id}')
-        emit('session_confirmed', {'session_id': session_id})
+        room_id = data.get('roomId')
+        print(f'🎬 Session started: {room_id}')
+        if room_id:
+            join_room(room_id)
+            emit('session-confirmed', {'status': 'active', 'roomId': room_id, 'timestamp': time.time()})
     except Exception as e:
-        print(f'❌ Error in session start handler: {e}')
+        print(f'❌ Error in session start: {e}')
 
 @socketio.on('leave-room')
 def handle_leave():
     try:
-        print('👋 User left room')
-        analyzer.transcript_buffer.clear()
+        print(f'👋 User left: {request.sid}')
+        emit('session-ended', {'status': 'ended', 'timestamp': time.time()})
     except Exception as e:
-        print(f'❌ Error in leave room handler: {e}')
+        print(f'❌ Error in leave: {e}')
 
-@socketio.on('get_conversation_summary')
-def handle_get_summary():
-    """Get conversation summary"""
+@socketio.on('audio-data')
+def handle_audio_data(data):
     try:
-        balance = analyzer.get_conversation_balance()
-        
-        # Get full transcript
-        transcript_text = '\n'.join([
-            f"[{t['speaker']}]: {t['text']}" 
-            for t in analyzer.transcript_buffer
-        ])
-        
-        emit('conversation_summary', {
-            'balance': balance,
-            'transcript': transcript_text,
-            'total_messages': len(analyzer.transcript_buffer)
-        })
-        
+        if AUDIO_PIPELINE_AVAILABLE:
+            audio_bytes = data.get('audio')
+            if audio_bytes:
+                transcript = transcribe_audio_stream(audio_bytes)
+                if transcript:
+                    emit('transcription-result', {'text': transcript, 'timestamp': time.time()})
+        else:
+            print("⚠️ Audio pipeline not available")
     except Exception as e:
-        print(f'❌ Error getting summary: {e}')
-        emit('error', {'message': str(e)})
+        print(f'❌ Error processing audio: {e}')
 
-# --- HTTP ROUTES ---
+# === ROUTES ===
 @app.route('/')
 def serve_frontend():
     try:
@@ -471,43 +510,39 @@ def serve_frontend():
 def health_check():
     return {
         'status': 'healthy',
-        'mode': 'Voice-Focused',
-        'whisper_available': WHISPER_AVAILABLE,
-        'features': [
-            'Speech-to-Text (Browser + Whisper)' if WHISPER_AVAILABLE else 'Speech-to-Text (Browser)',
-            'Emotion Detection (Text-based)',
-            'Objection Detection',
-            'Tone Analysis',
-            'Conversation Analytics'
-        ]
+        'analyzer_running': analyzer.running,
+        'mode': 'Real-time CV/ML' if LIBRARIES_AVAILABLE else 'Simulation',
+        'emotion_detection': 'DeepFace' if DEEPFACE_AVAILABLE else 'Geometric' if LIBRARIES_AVAILABLE else 'Simulated',
+        'audio_pipeline': 'Active' if AUDIO_PIPELINE_AVAILABLE else 'Disabled',
+        'timestamp': time.time()
     }
 
-@app.route('/api/analyze', methods=['POST'])
-def api_analyze():
-    """REST API endpoint for text analysis"""
-    try:
-        data = request.get_json()
-        text = data.get('text', '')
-        speaker = data.get('speaker', 'user')
-        
-        result = analyzer.analyze_comprehensive(text, speaker)
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
+@app.route('/api/status')
+def api_status():
+    return {
+        'cv_ml_available': LIBRARIES_AVAILABLE,
+        'deepface_available': DEEPFACE_AVAILABLE,
+        'audio_pipeline_available': AUDIO_PIPELINE_AVAILABLE,
+        'analyzer_running': analyzer.running,
+        'server_time': time.time()
+    }
 
-# --- STARTUP ---
+def start_background_task():
+    time.sleep(2)
+    analyzer.run()
+
 if __name__ == '__main__':
+    threading.Thread(target=start_background_task, daemon=True).start()
+    
     print("=" * 60)
-    print("🎤 InsightEngine P2P Backend - Voice-Focused Mode")
+    print("🌍 InsightEngine P2P Backend Server")
     print("=" * 60)
     print(f"📡 Server: http://0.0.0.0:5000")
-    print(f"🎙️ Mode: Voice & Text Analysis")
-    print(f"🗣️ Speech-to-Text: {'Whisper (AI) + Browser' if WHISPER_AVAILABLE else 'Browser Only'}")
-    print(f"😊 Emotion Detection: Text-based Analysis")
-    print(f"🎭 Tone Analysis: Active")
-    print(f"💬 Objection Detection: Active")
-    print(f"📊 Conversation Analytics: Active")
+    print(f"🔬 Mode: {'Real-time CV/ML' if LIBRARIES_AVAILABLE else 'Simulation'}")
+    print(f"💓 Heart Rate: {'✅ Active' if LIBRARIES_AVAILABLE else '❌ Simulated'}")
+    print(f"😊 Emotions: {'✅ DeepFace' if DEEPFACE_AVAILABLE else '✅ Geometric' if LIBRARIES_AVAILABLE else '❌ Random'}")
+    print(f"👁️ Gaze: {'✅ Active' if LIBRARIES_AVAILABLE else '❌ Simulated'}")
+    print(f"🎙️ Audio Pipeline: {'✅ Active' if AUDIO_PIPELINE_AVAILABLE else '❌ Disabled'}")
     print("=" * 60)
     
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
