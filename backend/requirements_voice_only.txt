@@ -19,3 +19,19 @@ eventlet==0.35.2
 # For future AI enhancements (optional)
 # openai==1.12.0
 # anthropic==0.18.0
+
+
+
+
+
+
+
+
+
+
+from audio_pipeline.transcribe_whisper import WhisperTranscriber
+from audio_pipeline.diarization_pyannote import Diarizer
+from audio_pipeline.text_emotion_distilbert import TextEmotionClassifier
+from audio_pipeline.objections_spacy import ObjectionClassifier
+from audio_pipeline.sarcasm_roberta import SarcasmSentimentModel
+from audio_pipeline.confidence_librosa import ConfidenceAnalyzer
