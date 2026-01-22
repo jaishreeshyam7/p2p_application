@@ -25,12 +25,18 @@ from faster_whisper import WhisperModel
 import numpy as np
 
 class WhisperTranscriber:
-    def __init__(self, model_size: str = "base", device: str = "cuda"):
+    def __init__(self, model_size: str = "base", device: str = "cpu"):
         # model_size: tiny / base / small / medium / large-v2
+        # Auto-detect compute type based on device
+        if device == "cpu":
+            compute_type = "int8"  # CPU-compatible
+        else:
+            compute_type = "float16"  # GPU-compatible
+        
         self.model = WhisperModel(
             model_size,
-            device=device,          # "cuda" or "cpu"
-            compute_type="float16"  # "int8" for even faster but slightly less accurate
+            device=device,
+            compute_type=compute_type
         )
 
     def transcribe(self, audio_path: str, language: str = "en",
