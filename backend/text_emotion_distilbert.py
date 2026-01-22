@@ -1,49 +1,135 @@
 """
-Text emotion classification using DistilBERT.
+Text emotion classification - LIGHTWEIGHT VERSION using TextBlob.
+
+This replaces the heavy DistilBERT model with a simple, fast alternative.
+No PyTorch or Transformers required!
 
 Input:
-  - One or more text snippets (from Whisper segments or speaker turns).
+  - Text snippet
 
-Processing:
-  - Use HF pipeline with an emotion‑finetuned DistilBERT/DistilRoBERTa model.
-  - Get probabilities for emotions like anger, joy, sadness, etc.
-
-Output (for one text):
+Output:
   {
-    "raw": {"anger": 3.2, "joy": 70.1, ...},  # % scores
+    "raw": {"joy": 70.1, "anger": 5.2, ...},
     "dominant": "joy"
   }
 """
 
-from transformers import pipeline
-import torch
+try:
+    from textblob import TextBlob
+    TEXTBLOB_AVAILABLE = True
+except ImportError:
+    TEXTBLOB_AVAILABLE = False
 
 class TextEmotionClassifier:
+    """Lightweight emotion classifier using TextBlob sentiment analysis."""
+    
     def __init__(self):
-        # Good open model for emotion classification
-        model_name = "j-hartmann/emotion-english-distilroberta-base"
-        self.pipe = pipeline(
-            "text-classification",
-            model=model_name,
-            top_k=None,  # return all labels with scores
-            device=0 if torch.cuda.is_available() else -1,
-        )
-
+        if not TEXTBLOB_AVAILABLE:
+            raise ImportError("TextBlob not available. Install with: pip install textblob")
+        
+        # Download required data
+        try:
+            import nltk
+            nltk.download('brown', quiet=True)
+            nltk.download('punkt', quiet=True)
+        except:
+            pass
+    
     def classify(self, text: str) -> dict:
+        """Classify emotions in text using sentiment analysis."""
         if not text or not text.strip():
             return {"raw": {}, "dominant": "neutral"}
-
-        result = self.pipe(text)[0]  # list of dicts
-        scores = {r["label"]: round(r["score"] * 100, 2) for r in result}
-        dominant = max(scores, key=scores.get)
-
-        return {"raw": scores, "dominant": dominant}
-
+        
+        # Get sentiment
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity  # -1 to 1
+        subjectivity = blob.sentiment.subjectivity  # 0 to 1
+        
+        # Convert sentiment to emotion scores
+        emotions = self._sentiment_to_emotions(polarity, subjectivity)
+        
+        # Find dominant emotion
+        dominant = max(emotions, key=emotions.get)
+        
+        return {
+            "raw": emotions,
+            "dominant": dominant
+        }
+    
+    def _sentiment_to_emotions(self, polarity: float, subjectivity: float) -> dict:
+        """
+        Map sentiment polarity/subjectivity to emotion categories.
+        
+        Polarity: -1 (negative) to +1 (positive)
+        Subjectivity: 0 (objective) to 1 (subjective)
+        """
+        emotions = {
+            "anger": 0,
+            "joy": 0,
+            "sadness": 0,
+            "fear": 0,
+            "surprise": 0,
+            "neutral": 50
+        }
+        
+        # Positive emotions
+        if polarity > 0.3:
+            emotions["joy"] = min(100, int(polarity * 100))
+            emotions["neutral"] = max(0, 50 - emotions["joy"])
+            if subjectivity > 0.7:
+                emotions["surprise"] = int(subjectivity * 30)
+        
+        # Negative emotions
+        elif polarity < -0.3:
+            anger_score = min(100, int(abs(polarity) * 100))
+            
+            # High subjectivity = anger, low = sadness
+            if subjectivity > 0.6:
+                emotions["anger"] = anger_score
+            else:
+                emotions["sadness"] = anger_score
+            
+            emotions["neutral"] = max(0, 50 - anger_score)
+        
+        # Mildly negative
+        elif polarity < -0.1:
+            if subjectivity > 0.5:
+                emotions["fear"] = int(abs(polarity) * 60)
+            else:
+                emotions["sadness"] = int(abs(polarity) * 50)
+            emotions["neutral"] = 40
+        
+        # Mildly positive
+        elif polarity > 0.1:
+            emotions["joy"] = int(polarity * 60)
+            emotions["neutral"] = 40
+        
+        # Neutral
+        else:
+            emotions["neutral"] = 70
+        
+        return emotions
+    
     def batch_classify(self, texts):
+        """Classify multiple texts."""
         return [self.classify(t) for t in texts]
 
 
 if __name__ == "__main__":
     clf = TextEmotionClassifier()
-    out = clf.classify("I'm excited, but a bit worried about the price.")
-    print(out)
+    
+    # Test cases
+    test_texts = [
+        "I'm so excited about this!",
+        "This is terrible and makes me angry.",
+        "I'm worried about the price.",
+        "The product looks okay.",
+        "This is amazing and wonderful!"
+    ]
+    
+    for text in test_texts:
+        result = clf.classify(text)
+        print(f"Text: {text}")
+        print(f"Dominant: {result['dominant']}")
+        print(f"Scores: {result['raw']}")
+        print()
