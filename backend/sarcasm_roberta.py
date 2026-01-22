@@ -1,87 +1,177 @@
 """
-Sarcasm & sentiment detector using RoBERTa-based models.
+Sarcasm detector - LIGHTWEIGHT VERSION using pattern matching.
+
+Replaces heavy RoBERTa model with rule-based detection.
+No PyTorch or Transformers required!
 
 Input:
-  - Text snippet (usually 1 sentence / segment).
-
-Processing:
-  - RoBERTa model #1: irony/sarcasm classifier.
-  - RoBERTa model #2: sentiment classifier (neg / neu / pos).
+  - Text snippet
 
 Output:
   {
-    "sarcasm": {"score": float, "is_sarcastic": bool},
-    "sentiment": {"label": str, "scores": {...}}
+    "sarcasm": {"score": 65.0, "is_sarcastic": True},
+    "sentiment": {"label": "negative", "scores": {...}}
   }
 """
 
-from typing import Dict
-
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
+import re
 
 class SarcasmSentimentModel:
+    """Lightweight sarcasm detector using pattern matching and keywords."""
+    
     def __init__(self):
-        # Twitter RoBERTa models work well on conversational language
-        sarcasm_name = "cardiffnlp/twitter-roberta-base-irony"
-        sent_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-
-        self.sarcasm_tok = AutoTokenizer.from_pretrained(sarcasm_name)
-        self.sarcasm_model = AutoModelForSequenceClassification.from_pretrained(
-            sarcasm_name
-        )
-
-        self.sent_tok = AutoTokenizer.from_pretrained(sent_name)
-        self.sent_model = AutoModelForSequenceClassification.from_pretrained(sent_name)
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.sarcasm_model.to(self.device)
-        self.sent_model.to(self.device)
-
-    def _predict(self, text: str, tok, model, labels) -> Dict:
-        inputs = tok(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=128,
-            padding=True,
-        ).to(self.device)
-
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = F.softmax(logits, dim=-1)[0].cpu().numpy()
-
-        scores = {label: round(float(p) * 100, 2) for label, p in zip(labels, probs)}
-        dominant = max(scores, key=scores.get)
-        return scores, dominant
-
-    def analyze(self, text: str) -> Dict:
-        # Sarcasm: labels [0=non-ironic, 1=ironic]
-        sarc_labels = ["not_sarcastic", "sarcastic"]
-        sarc_scores, sarc_label = self._predict(
-            text, self.sarcasm_tok, self.sarcasm_model, sarc_labels
-        )
-        sarcasm_score = sarc_scores["sarcastic"]
-
-        # Sentiment: labels [negative, neutral, positive]
-        sent_labels = ["negative", "neutral", "positive"]
-        sent_scores, sent_label = self._predict(
-            text, self.sent_tok, self.sent_model, sent_labels
-        )
-
+        # Sarcasm indicators
+        self.sarcasm_patterns = [
+            # Exaggeration
+            r"\b(oh (yeah|sure|great|wonderful|perfect))",
+            r"\b(totally|absolutely|definitely|obviously)\b.*\b(not|never)",
+            r"\b(right|sure),?\s+(because|like)",
+            
+            # Rhetorical questions
+            r"\b(what could (possibly|possibly|ever) go wrong)",
+            r"\b(who would have thought)",
+            r"\b(how surprising)",
+            
+            # Negative framing of positive words
+            r"\b(great|wonderful|amazing|fantastic),\s*just\s+(great|wonderful)",
+            r"\b(love|loving)\s+how",
+            
+            # Repetition for emphasis
+            r"(great|wonderful|perfect|fantastic).*\1",
+        ]
+        
+        # Sarcasm keywords
+        self.sarcasm_keywords = [
+            "obviously", "clearly", "brilliant", "genius", 
+            "shocker", "shocking", "surprise surprise",
+            "thrilled", "delighted", "exactly"
+        ]
+        
+        # Negative sentiment keywords
+        self.negative_words = [
+            "bad", "terrible", "awful", "worst", "hate", "annoying",
+            "frustrating", "disappointed", "useless", "waste"
+        ]
+        
+        # Positive sentiment keywords
+        self.positive_words = [
+            "good", "great", "excellent", "awesome", "love", "amazing",
+            "wonderful", "fantastic", "perfect", "best"
+        ]
+    
+    def analyze(self, text: str) -> dict:
+        """Analyze text for sarcasm and sentiment."""
+        if not text or not text.strip():
+            return {
+                "sarcasm": {"score": 0, "is_sarcastic": False, "scores": {"not_sarcastic": 100, "sarcastic": 0}},
+                "sentiment": {"label": "neutral", "scores": {"negative": 33, "neutral": 34, "positive": 33}}
+            }
+        
+        text_lower = text.lower()
+        
+        # Detect sarcasm
+        sarcasm_score = self._detect_sarcasm(text_lower)
+        
+        # Detect sentiment
+        sentiment = self._detect_sentiment(text_lower)
+        
         return {
             "sarcasm": {
                 "score": sarcasm_score,
                 "is_sarcastic": sarcasm_score > 50,
-                "scores": sarc_scores,
+                "scores": {
+                    "not_sarcastic": 100 - sarcasm_score,
+                    "sarcastic": sarcasm_score
+                }
             },
-            "sentiment": {"label": sent_label, "scores": sent_scores},
+            "sentiment": sentiment
+        }
+    
+    def _detect_sarcasm(self, text: str) -> float:
+        """Calculate sarcasm score (0-100)."""
+        score = 0
+        
+        # Check patterns
+        for pattern in self.sarcasm_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                score += 30
+        
+        # Check keywords
+        for keyword in self.sarcasm_keywords:
+            if keyword in text:
+                score += 15
+        
+        # Check for punctuation indicators
+        if text.count('!') >= 2:
+            score += 20
+        if '...' in text:
+            score += 10
+        
+        # Check for contradictory sentiment
+        # Positive words with negative context
+        has_positive = any(word in text for word in self.positive_words)
+        has_negative = any(word in text for word in self.negative_words)
+        
+        if has_positive and has_negative:
+            score += 25
+        
+        # Exclamation + question mark (e.g., "Great!?")
+        if '!' in text and '?' in text:
+            score += 15
+        
+        return min(100, score)
+    
+    def _detect_sentiment(self, text: str) -> dict:
+        """Detect sentiment (positive/neutral/negative)."""
+        positive_count = sum(1 for word in self.positive_words if word in text)
+        negative_count = sum(1 for word in self.negative_words if word in text)
+        
+        total = positive_count + negative_count
+        
+        if total == 0:
+            return {
+                "label": "neutral",
+                "scores": {"negative": 33, "neutral": 34, "positive": 33}
+            }
+        
+        # Calculate percentages
+        positive_pct = (positive_count / total) * 100 if total > 0 else 0
+        negative_pct = (negative_count / total) * 100 if total > 0 else 0
+        neutral_pct = 100 - positive_pct - negative_pct
+        
+        # Determine dominant
+        if positive_pct > negative_pct and positive_pct > 40:
+            label = "positive"
+        elif negative_pct > positive_pct and negative_pct > 40:
+            label = "negative"
+        else:
+            label = "neutral"
+        
+        return {
+            "label": label,
+            "scores": {
+                "negative": round(negative_pct, 2),
+                "neutral": round(neutral_pct, 2),
+                "positive": round(positive_pct, 2)
+            }
         }
 
 
 if __name__ == "__main__":
-    m = SarcasmSentimentModel()
-    t1 = "Oh great, another sales pitch. Wonderful."
-    print(m.analyze(t1))
+    model = SarcasmSentimentModel()
+    
+    # Test cases
+    test_texts = [
+        "Oh great, another sales pitch. Wonderful.",
+        "This product is absolutely fantastic!",
+        "Yeah, sure, because that totally makes sense.",
+        "I love how you completely ignored my concerns.",
+        "The product works well and I'm satisfied."
+    ]
+    
+    for text in test_texts:
+        result = model.analyze(text)
+        print(f"Text: {text}")
+        print(f"Sarcasm: {result['sarcasm']['score']}% - {result['sarcasm']['is_sarcastic']}")
+        print(f"Sentiment: {result['sentiment']['label']}")
+        print()
