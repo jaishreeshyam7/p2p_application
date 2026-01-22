@@ -1,0 +1,35 @@
+# ===================================================
+# LIGHTWEIGHT REQUIREMENTS - FOR CODESPACES
+# ===================================================
+# Total size: ~500MB (vs 6GB for full ML stack)
+# All modules will work with these dependencies!
+
+# Flask & Socket.IO (Backend)
+flask==3.0.0
+flask-socketio==5.3.5
+flask-cors==4.0.0
+python-socketio==5.10.0
+
+# Audio Processing
+faster-whisper==0.10.0  # Whisper transcription (CPU-friendly)
+librosa==0.10.1         # Confidence analysis
+soundfile==0.12.1       # Audio file reading
+
+# Lightweight NLP (replaces Transformers + PyTorch)
+textblob==0.17.1        # Emotion analysis (sentiment-based)
+nltk==3.8.1             # Natural language toolkit
+
+# No additional dependencies needed for:
+# - sarcasm_roberta.py (uses regex patterns)
+# - objections_spacy.py (uses regex patterns)
+# - diarization_pyannote.py (uses mock segments)
+
+# ===================================================
+# OPTIONAL: For full ML features (6GB+)
+# ===================================================
+# Uncomment only if you have 10GB+ storage and GPU:
+
+# torch==2.1.0  # PyTorch (2GB)
+# transformers==4.36.0  # HuggingFace models (1.5GB)
+# spacy==3.7.2  # Advanced NLP (500MB)
+# pyannote.audio==3.1.0  # Speaker diarization (1GB)
