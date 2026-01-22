@@ -60,18 +60,34 @@ const InsightEngineApp = () => {
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttempts = useRef(0);
 
-  // Get Backend URL
+  // Get Backend URL - FIXED FOR CODESPACES
   const getBackendURL = () => {
+    // Check for explicit env variable first
     if (process.env.REACT_APP_BACKEND_URL) {
       return process.env.REACT_APP_BACKEND_URL;
     }
+    
     const hostname = window.location.hostname;
-    if (hostname.includes('github.dev') || hostname.includes('preview.app.github.dev')) {
-      return window.location.origin.replace('3000', '5000');
+    
+    // GitHub Codespaces detection
+    if (hostname.includes('github.dev') || hostname.includes('app.github.dev')) {
+      // Extract the unique codespace ID
+      const match = hostname.match(/([\w-]+)-\d+\.app\.github\.dev/);
+      if (match) {
+        const codespaceId = match[1];
+        // Backend is on port 5000
+        return `https://${codespaceId}-5000.app.github.dev`;
+      }
+      // Fallback: replace port in current URL
+      return window.location.origin.replace('-3000.', '-5000.');
     }
+    
+    // Local development
     if (hostname === 'localhost' || hostname === '127.0.0.1') {
       return 'http://localhost:5000';
     }
+    
+    // Production or unknown
     return window.location.origin;
   };
 
@@ -85,7 +101,8 @@ const InsightEngineApp = () => {
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionAttempts: 10,
-      timeout: 10000
+      timeout: 10000,
+      path: '/socket.io'
     });
 
     // Connection Events
