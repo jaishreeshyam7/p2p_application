@@ -59,6 +59,7 @@ const InsightEngineApp = () => {
   const audioContextRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttempts = useRef(0);
+  const transcriptFeedRef = useRef(null);
 
   // Get Backend URL - FIXED FOR CODESPACES
   const getBackendURL = () => {
@@ -434,10 +435,10 @@ const InsightEngineApp = () => {
     setAiSuggestion('🔍 Analyzing...');
   };
 
+  // Auto-scroll transcript to bottom when new messages arrive
   useEffect(() => {
-    const feed = document.getElementById('transcript-feed');
-    if (feed) {
-      feed.scrollTop = feed.scrollHeight;
+    if (transcriptFeedRef.current) {
+      transcriptFeedRef.current.scrollTop = transcriptFeedRef.current.scrollHeight;
     }
   }, [transcript]);
 
@@ -480,7 +481,7 @@ const InsightEngineApp = () => {
   return (
     <div className="bg-gray-900 text-gray-100 h-screen overflow-hidden flex flex-col">
       {/* Navbar */}
-      <nav className="h-16 bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 md:px-6 z-50">
+      <nav className="h-16 bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 md:px-6 z-50 flex-shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center shadow-lg shadow-indigo-500/30">
             <Mic className="w-4 h-4 text-white" />
@@ -576,14 +577,14 @@ const InsightEngineApp = () => {
         </div>
       )}
 
-      {/* Main Content */}
-      <div className="flex-1 grid md:grid-cols-[1fr_400px] overflow-hidden">
+      {/* Main Content - FIXED HEIGHT CONSTRAINT */}
+      <div className="flex-1 grid md:grid-cols-[1fr_400px] overflow-hidden min-h-0">
         
         {/* Voice Visualization Area */}
         <div className="relative bg-gradient-to-br from-gray-900 via-indigo-950 to-gray-900 flex items-center justify-center overflow-hidden">
           
           {isConnected && (
-            <div className="text-center space-y-8 w-full max-w-3xl px-8">
+            <div className="text-center space-y-8 w-full max-w-3xl px-8 overflow-y-auto max-h-full">
               <div className="relative">
                 <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-30 animate-pulse"></div>
                 <div className="w-40 h-40 bg-gradient-to-br from-indigo-600 to-purple-600 rounded-full flex items-center justify-center relative z-10 shadow-2xl shadow-indigo-500/50 mx-auto">
@@ -658,12 +659,12 @@ const InsightEngineApp = () => {
           )}
         </div>
 
-        {/* Sidebar */}
-        <div className="bg-gray-900/95 backdrop-blur-md border-l border-gray-800 flex flex-col">
+        {/* Sidebar - FIXED HEIGHT AND OVERFLOW */}
+        <div className="bg-gray-900/95 backdrop-blur-md border-l border-gray-800 flex flex-col h-full overflow-hidden">
           
-          {/* Transcript */}
-          <div className="flex-1 flex flex-col min-h-0">
-            <div className="p-3 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center">
+          {/* Transcript Section - PROPERLY CONSTRAINED */}
+          <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+            <div className="p-3 border-b border-gray-700 bg-gray-800/50 flex justify-between items-center flex-shrink-0">
               <span className="text-xs font-bold text-gray-400 uppercase flex items-center gap-2">
                 <AlignLeft className="w-3 h-3" />
                 Live Transcript
@@ -675,7 +676,17 @@ const InsightEngineApp = () => {
               )}
             </div>
             
-            <div id="transcript-feed" className="flex-1 overflow-y-auto p-4 space-y-3 text-sm">
+            {/* Transcript Feed - THIS IS THE KEY FIX */}
+            <div 
+              ref={transcriptFeedRef}
+              className="flex-1 overflow-y-auto p-4 space-y-3 text-sm min-h-0"
+              style={{ 
+                maxHeight: '100%',
+                overflowY: 'auto',
+                overflowX: 'hidden',
+                wordBreak: 'break-word'
+              }}
+            >
               {transcript.length === 0 ? (
                 <div className="text-center text-gray-600 italic text-xs mt-10">
                   <MicOff className="w-8 h-8 mx-auto mb-2 opacity-30" />
@@ -696,14 +707,14 @@ const InsightEngineApp = () => {
                       </span>
                       <span className="text-gray-600 text-xs">{entry.timestamp}</span>
                     </div>
-                    <p className="text-gray-300 leading-relaxed">{entry.text}</p>
+                    <p className="text-gray-300 leading-relaxed break-words">{entry.text}</p>
                   </div>
                 ))
               )}
             </div>
 
             {isConnected && (
-              <div className="p-2 border-t border-gray-700 bg-gray-800/30">
+              <div className="p-2 border-t border-gray-700 bg-gray-800/30 flex-shrink-0">
                 <input 
                   type="text"
                   placeholder="Type message (or speak)..."
@@ -714,9 +725,9 @@ const InsightEngineApp = () => {
             )}
           </div>
 
-          {/* AI Coach */}
-          <div className="h-1/3 border-t border-indigo-500/20 bg-indigo-900/5 flex flex-col min-h-[150px]">
-            <div className="p-3 border-b border-indigo-500/20 flex justify-between items-center bg-indigo-900/20">
+          {/* AI Coach Section - FIXED HEIGHT */}
+          <div className="h-48 border-t border-indigo-500/20 bg-indigo-900/5 flex flex-col flex-shrink-0 overflow-hidden">
+            <div className="p-3 border-b border-indigo-500/20 flex justify-between items-center bg-indigo-900/20 flex-shrink-0">
               <span className="text-xs font-bold text-indigo-300 uppercase flex items-center gap-2">
                 <Bot className="w-3 h-3" />
                 AI Coach
@@ -732,8 +743,8 @@ const InsightEngineApp = () => {
               )}
             </div>
             
-            <div className="flex-1 p-4 overflow-y-auto">
-              <div className="text-sm text-indigo-100/90 leading-relaxed">
+            <div className="flex-1 p-4 overflow-y-auto min-h-0">
+              <div className="text-sm text-indigo-100/90 leading-relaxed break-words">
                 {aiSuggestion || (
                   <div className="flex items-center gap-2 text-indigo-300/50 italic text-xs">
                     <div className="w-3 h-3 border-2 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin" />
@@ -752,6 +763,22 @@ const InsightEngineApp = () => {
           to { opacity: 1; transform: translateY(0); }
         }
         .animate-fade-in { animation: fadeIn 0.3s ease-out; }
+        
+        /* Custom scrollbar for transcript */
+        .overflow-y-auto::-webkit-scrollbar {
+          width: 6px;
+        }
+        .overflow-y-auto::-webkit-scrollbar-track {
+          background: rgba(31, 41, 55, 0.5);
+          border-radius: 3px;
+        }
+        .overflow-y-auto::-webkit-scrollbar-thumb {
+          background: rgba(75, 85, 99, 0.8);
+          border-radius: 3px;
+        }
+        .overflow-y-auto::-webkit-scrollbar-thumb:hover {
+          background: rgba(107, 114, 128, 1);
+        }
       `}</style>
     </div>
   );
