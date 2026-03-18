@@ -1,315 +1,219 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './App.css';
 import io from 'socket.io-client';
-import { Mic, MicOff, PhoneOff, Activity, Bot, AlignLeft, Zap, AlertTriangle, MessageSquare, TrendingUp, Volume2 } from 'lucide-react';
+import { Mic, MicOff, PhoneOff, Activity, Bot, AlignLeft, Volume2 } from 'lucide-react';
+import webgazer from 'webgazer';
 
+// ==========================================
+// 1. SUBCOMPONENTS
+// ==========================================
+const MetricBar = ({ label, value, max, color }) => (
+  <div className="mb-2">
+    <div className="flex justify-between text-xs mb-1">
+      <span className="text-gray-400">{label}</span>
+      <span className="text-gray-300 font-mono">{value}{max ? `/${max}` : ''}</span>
+    </div>
+    <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+      <div 
+        className={`h-full ${color} rounded-full transition-all duration-500`} 
+        style={{ width: `${max ? (value/max)*100 : value}%` }} 
+      />
+    </div>
+  </div>
+);
+
+// ==========================================
+// 2. CUSTOM HOOKS (Extracted Logic)
+// ==========================================
+const useEyeTracking = () => {
+  const [isLookingAway, setIsLookingAway] = useState(false);
+
+  const initEyeTracking = useCallback(async () => {
+    try {
+      await webgazer.setGazeListener((data) => {
+        if (!data) return;
+
+        const screenWidth = window.innerWidth;
+        const screenHeight = window.innerHeight;
+
+        // "Safe Zone" (center 60% of screen)
+        const isOutX = data.x < screenWidth * 0.2 || data.x > screenWidth * 0.8;
+        const isOutY = data.y < screenHeight * 0.1 || data.y > screenHeight * 0.9;
+
+        setIsLookingAway(isOutX || isOutY);
+      }).begin();
+
+      // Run silently in the background
+      webgazer.showVideoPreview(false);
+      webgazer.showPredictionPoints(false); 
+    } catch (e) {
+      console.error("Eye tracking failed:", e);
+    }
+  }, []);
+
+  const stopEyeTracking = useCallback(() => {
+    if (window.webgazer) {
+      window.webgazer.pause();
+      window.webgazer.end();
+    }
+    setIsLookingAway(false);
+  }, []);
+
+  return { isLookingAway, initEyeTracking, stopEyeTracking };
+};
+
+// ==========================================
+// 3. MAIN APPLICATION COMPONENT
+// ==========================================
 const InsightEngineApp = () => {
-  // State Management
+  // --- STATE MANAGEMENT ---
   const [isInLobby, setIsInLobby] = useState(true);
   const [isWaiting, setIsWaiting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('offline');
-  const [voiceModules, setVoiceModules] = useState({
-    transcribe: false,
-    text_emotion: false,
-    sarcasm: false,
-    objections: false,
-    diarization: false,
-    confidence: false
-  });
+  const [currentRoomId, setCurrentRoomId] = useState(null); 
+  
   const [transcript, setTranscript] = useState([]);
   const [aiSuggestion, setAiSuggestion] = useState('');
   const [isMuted, setIsMuted] = useState(false);
   
-  // Voice-specific Analytics
-  const [voiceAnalytics, setVoiceAnalytics] = useState({
-    confidence_score: 75,
-    pitch_stability: 0,
-    volume_stability: 0,
-    avg_pitch_hz: 0,
-    jitter: 0,
-    shimmer: 0
-  });
-  
-  const [voiceMetrics, setVoiceMetrics] = useState({
-    wpm: 0,
-    total_words: 0,
-    duration: 0,
-    pauses_count: 0
-  });
-  
-  const [emotions, setEmotions] = useState({
-    anger: 0,
-    joy: 0,
-    sadness: 0,
-    fear: 0,
-    surprise: 0,
-    neutral: 60
-  });
-  
+  const [voiceAnalytics, setVoiceAnalytics] = useState({ confidence_score: 0, pitch_stability: 0, volume_stability: 0 });
+  const [voiceMetrics, setVoiceMetrics] = useState({ wpm: 0, pauses_count: 0 });
   const [dominantEmotion, setDominantEmotion] = useState('neutral');
   const [sarcasmDetected, setSarcasmDetected] = useState(false);
-  const [lastObjection, setLastObjection] = useState(null);
-  
-  // Refs
+
+  // --- REFS & CUSTOM HOOKS ---
   const localAudioRef = useRef(null);
   const socketRef = useRef(null);
   const recognitionRef = useRef(null);
+<<<<<<< HEAD
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttempts = useRef(0);
   const transcriptFeedRef = useRef(null);
+=======
+  const activeRecorderRef = useRef(null); 
+  const isStreamingRef = useRef(false);   
+  const transcriptFeedRef = useRef(null);
+  
+  // Bring in our custom eye tracking logic
+  const { isLookingAway, initEyeTracking, stopEyeTracking } = useEyeTracking();
+>>>>>>> c687ba6 (important changes)
 
-  // Get Backend URL - FIXED FOR CODESPACES
+  // --- CONNECTION LOGIC ---
   const getBackendURL = () => {
-    // Check for explicit env variable first
-    if (process.env.REACT_APP_BACKEND_URL) {
-      return process.env.REACT_APP_BACKEND_URL;
-    }
-    
+    if (process.env.REACT_APP_BACKEND_URL) return process.env.REACT_APP_BACKEND_URL;
     const hostname = window.location.hostname;
-    
-    // GitHub Codespaces detection
     if (hostname.includes('github.dev') || hostname.includes('app.github.dev')) {
-      // Extract the unique codespace ID
       const match = hostname.match(/([\w-]+)-\d+\.app\.github\.dev/);
-      if (match) {
-        const codespaceId = match[1];
-        // Backend is on port 5000
-        return `https://${codespaceId}-5000.app.github.dev`;
-      }
-      // Fallback: replace port in current URL
+      if (match) return `https://${match[1]}-5000.app.github.dev`;
       return window.location.origin.replace('-3000.', '-5000.');
     }
-    
-    // Local development
-    if (hostname === 'localhost' || hostname === '127.0.0.1') {
-      return 'http://localhost:5000';
-    }
-    
-    // Production or unknown
-    return window.location.origin;
+    return hostname === 'localhost' ? 'http://localhost:5000' : window.location.origin;
   };
 
-  // Socket.IO Connection
   useEffect(() => {
     const BACKEND_URL = getBackendURL();
-    console.log('🔗 Connecting to voice-only backend:', BACKEND_URL);
-    
     socketRef.current = io(BACKEND_URL, {
       transports: ['websocket', 'polling'],
       reconnection: true,
-      reconnectionDelay: 1000,
-      reconnectionAttempts: 10,
-      timeout: 10000,
       path: '/socket.io'
     });
 
-    // Connection Events
-    socketRef.current.on('connect', () => {
-      console.log('✅ Connected to backend:', socketRef.current.id);
-      setConnectionStatus('online');
-      reconnectAttempts.current = 0;
-    });
+    socketRef.current.on('connect', () => setConnectionStatus('online'));
+    socketRef.current.on('disconnect', () => setConnectionStatus('offline'));
 
-    socketRef.current.on('disconnect', () => {
-      console.log('❌ Disconnected from backend');
-      setConnectionStatus('offline');
-      addTranscript('System', '⚠️ Disconnected. Reconnecting...');
-    });
-
-    socketRef.current.on('connect_error', (error) => {
-      console.error('❌ Connection error:', error);
-      setConnectionStatus('error');
-      
-      reconnectAttempts.current += 1;
-      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 30000);
-      
-      if (reconnectAttempts.current <= 5) {
-        addTranscript('System', `Retrying in ${delay/1000}s... (${reconnectAttempts.current}/5)`);
-      }
-    });
-
-    socketRef.current.on('connection_status', (data) => {
-      console.log('📊 Backend status:', data);
-      if (data.modules) {
-        setVoiceModules(data.modules);
-      }
-      addTranscript('System', `✅ Connected in ${data.mode || 'voice'} mode`);
-    });
-
-    // Voice-specific events
-    socketRef.current.on('transcription-result', (data) => {
-      console.log('📝 Transcription:', data);
-      addTranscript(data.speaker || 'Detected', data.text);
-    });
-
-    socketRef.current.on('confidence-update', (data) => {
-      console.log('💪 Confidence update:', data);
-      setVoiceAnalytics({
-        confidence_score: data.confidence_score || 75,
-        pitch_stability: data.pitch_stability || 0,
-        volume_stability: data.volume_stability || 0,
-        avg_pitch_hz: data.avg_pitch_hz || 0,
-        jitter: data.jitter || 0,
-        shimmer: data.shimmer || 0
-      });
-    });
-
-    socketRef.current.on('voice-metrics', (data) => {
-      console.log('📊 Voice metrics:', data);
-      setVoiceMetrics({
-        wpm: data.wpm || 0,
-        total_words: data.total_words || 0,
-        duration: data.duration || 0,
-        pauses_count: data.pauses_count || 0
-      });
-    });
-
-    socketRef.current.on('emotion-update', (data) => {
-      console.log('😊 Emotion update:', data);
-      if (data.emotions) {
-        setEmotions(data.emotions);
-      }
-      if (data.dominant) {
-        setDominantEmotion(data.dominant);
-      }
-    });
-
-    socketRef.current.on('sarcasm-detected', (data) => {
-      console.log('😏 Sarcasm detected:', data);
-      setSarcasmDetected(true);
-      addTranscript('AI Alert', `😏 Sarcasm detected (${data.score}%): "${data.text}"`);
-      setTimeout(() => setSarcasmDetected(false), 5000);
-    });
-
-    socketRef.current.on('objection-detected', (data) => {
-      console.log('🚨 Objection detected:', data);
-      setLastObjection(data);
-      addTranscript('AI Coach', data.suggestion);
-      setAiSuggestion(data.suggestion);
-    });
-
-    socketRef.current.on('match-found', handleMatchFound);
-    socketRef.current.on('session-confirmed', (data) => {
-      console.log('✅ Session confirmed:', data);
-      addTranscript('System', '✅ Voice session active');
-    });
-    socketRef.current.on('peer-disconnected', handlePeerDisconnected);
-    socketRef.current.on('session-ended', () => {
-      addTranscript('System', 'Session ended');
-    });
+    // Metric Listeners
+    socketRef.current.on('transcription-result', (data) => addTranscript(data.speaker || 'Detected', data.text));
+    socketRef.current.on('confidence-update', (data) => setVoiceAnalytics(prev => ({ ...prev, ...data })));
+    socketRef.current.on('voice-metrics', (data) => setVoiceMetrics(prev => ({ ...prev, ...data })));
+    socketRef.current.on('emotion-update', (data) => { if (data.dominant) setDominantEmotion(data.dominant); });
     
-    socketRef.current.on('ai-response', handleAiResponse);
-    socketRef.current.on('error', (data) => {
-      console.error('❌ Backend error:', data);
-      addTranscript('System', `❌ ${data.message || 'Error occurred'}`);
+    // Gemini Chatbot Listener
+    socketRef.current.on('ai-response', (data) => setAiSuggestion(data.suggestion));
+
+    // Session Listeners
+    socketRef.current.on('match-found', handleMatchFound);
+    socketRef.current.on('peer-disconnected', () => {
+      addTranscript('System', '👋 Partner left');
+      setTimeout(stopSession, 2000);
     });
 
     return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
+      socketRef.current?.disconnect();
       stopMediaStreams();
+      stopEyeTracking();
     };
   }, []);
 
-  // Start Session
+  // --- ACTIONS ---
   const startMatchmaking = async () => {
     setIsInLobby(false);
     setIsWaiting(true);
-
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 16000
-        },
-        video: false
-      });
-      
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localAudioRef.current = stream;
       setConnectionStatus('connecting');
-      
-      socketRef.current?.emit('identify', { 
-        type: 'user', 
-        timestamp: Date.now() 
-      });
-      
-      setTimeout(() => {
-        handleMatchFound({ roomId: 'room-' + Date.now() });
-      }, 2000);
-
+      socketRef.current?.emit('identify', { type: 'user' });
+      // Simulate match
+      setTimeout(() => handleMatchFound({ roomId: 'room-' + Date.now() }), 1500);
     } catch (err) {
-      console.error('Microphone error:', err);
-      alert('Microphone access required. Please allow access and try again.');
+      alert('Microphone access required');
       stopSession();
     }
   };
 
-  // Handle Match Found
   const handleMatchFound = (data) => {
-    console.log('🎯 Match found:', data);
     setIsWaiting(false);
     setIsConnected(true);
     setConnectionStatus('connected');
-
+    setCurrentRoomId(data.roomId);
+    
     initSpeechRecognition();
-    startAudioStreaming();
+    startAudioStreaming(data.roomId);
+    initEyeTracking(); // Start monitoring the webcam for eye movement
     
     socketRef.current?.emit('session-started', { roomId: data.roomId });
-    addTranscript('System', `🎯 Session: ${data.roomId}`);
+    addTranscript('System', `🎯 Session Active`);
   };
 
-  // Audio Streaming
-  const startAudioStreaming = () => {
+  const startAudioStreaming = (roomId) => {
     if (!localAudioRef.current) return;
+    isStreamingRef.current = true;
 
-    try {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      
-      mediaRecorderRef.current = new MediaRecorder(localAudioRef.current, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 16000
-      });
+    const recordSegment = () => {
+      if (!isStreamingRef.current || !localAudioRef.current) return;
 
-      mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0 && socketRef.current && !isMuted) {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64Audio = reader.result.split(',')[1];
-            socketRef.current.emit('audio-data', { audio: base64Audio });
-          };
-          reader.readAsDataURL(event.data);
-        }
-      };
+      try {
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+        const recorder = new MediaRecorder(localAudioRef.current, { mimeType, audioBitsPerSecond: 16000 });
+        const chunks = [];
 
-      mediaRecorderRef.current.start(3000); // Send chunks every 3 seconds
-      console.log('🎤 Audio streaming started');
-      
-    } catch (err) {
-      console.error('Audio streaming error:', err);
-      addTranscript('System', '⚠️ Audio streaming unavailable');
-    }
+        recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+        recorder.onstop = () => {
+          if (chunks.length > 0 && socketRef.current && !isMuted) {
+            const blob = new Blob(chunks, { type: mimeType });
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              if (reader.result) {
+                socketRef.current.emit('audio-chunk', { audio: reader.result.split(',')[1], roomId: roomId });
+              }
+            };
+            reader.readAsDataURL(blob);
+          }
+          if (isStreamingRef.current) recordSegment();
+        };
+
+        activeRecorderRef.current = recorder;
+        recorder.start();
+        setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, 3000);
+      } catch (e) { console.error('Streaming error', e); }
+    };
+
+    recordSegment();
   };
 
-  const handlePeerDisconnected = () => {
-    addTranscript('System', '👋 Partner left');
-    setTimeout(() => stopSession(), 2000);
-  };
-
-  const handleAiResponse = (data) => {
-    console.log('🤖 AI Response:', data);
-    setAiSuggestion(data.suggestion || data.message || '');
-  };
-
-  // Stop Session
   const stopSession = () => {
     setIsConnected(false);
     setIsWaiting(false);
@@ -317,45 +221,29 @@ const InsightEngineApp = () => {
     setConnectionStatus('online');
     setTranscript([]);
     setAiSuggestion('');
-    setSarcasmDetected(false);
-    setLastObjection(null);
-
+    
+    isStreamingRef.current = false;
     stopMediaStreams();
     stopSpeechRecognition();
+    stopEyeTracking(); // Stop WebGazer
+    
     socketRef.current?.emit('leave-room');
   };
 
   const stopMediaStreams = () => {
-    if (localAudioRef.current) {
-      localAudioRef.current.getTracks().forEach(track => track.stop());
-      localAudioRef.current = null;
-    }
-    if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
+    if (activeRecorderRef.current && activeRecorderRef.current.state !== 'inactive') activeRecorderRef.current.stop();
+    localAudioRef.current?.getTracks().forEach(t => t.stop());
   };
 
   const toggleMute = () => {
     if (localAudioRef.current) {
-      localAudioRef.current.getAudioTracks().forEach(track => {
-        track.enabled = !track.enabled;
-      });
+      localAudioRef.current.getAudioTracks().forEach(t => t.enabled = !t.enabled);
       setIsMuted(!isMuted);
     }
   };
 
-  // Speech Recognition
   const initSpeechRecognition = () => {
-    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
-      addTranscript('System', '⚠️ Speech recognition unavailable');
-      return;
-    }
-
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) return;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     recognitionRef.current = new SpeechRecognition();
     recognitionRef.current.continuous = true;
@@ -364,159 +252,85 @@ const InsightEngineApp = () => {
 
     recognitionRef.current.onresult = (event) => {
       const last = event.results.length - 1;
-      const text = event.results[last][0].transcript;
-      
       if (event.results[last].isFinal) {
+        const text = event.results[last][0].transcript;
         addTranscript('You', text);
-        socketRef.current?.emit('transcript', { 
-          speaker: 'user', 
-          text,
-          timestamp: Date.now()
-        });
+        socketRef.current?.emit('transcript', { speaker: 'user', text, timestamp: Date.now(), roomId: currentRoomId });
       }
     };
-
-    recognitionRef.current.onerror = (event) => {
-      if (event.error !== 'no-speech' && event.error !== 'aborted') {
-        console.error('Speech recognition error:', event.error);
-      }
-    };
-
-    recognitionRef.current.onend = () => {
-      if (isConnected && recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch (e) {}
-      }
-    };
-
-    try {
-      recognitionRef.current.start();
-      console.log('🎤 Speech recognition started');
-    } catch (err) {
-      console.error('Failed to start speech recognition:', err);
-    }
+    
+    recognitionRef.current.onerror = (e) => { if (e.error === 'network') setTimeout(() => recognitionRef.current?.start(), 1000); };
+    try { recognitionRef.current.start(); } catch (e) {}
   };
 
-  const stopSpeechRecognition = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
-    }
-  };
+  const stopSpeechRecognition = () => recognitionRef.current?.stop();
 
   const addTranscript = (speaker, text) => {
-    setTranscript(prev => [...prev, {
-      id: Date.now() + Math.random(),
-      speaker,
-      text,
-      timestamp: new Date().toLocaleTimeString()
-    }]);
+    setTranscript(prev => [...prev, { id: Date.now() + Math.random(), speaker, text, timestamp: new Date().toLocaleTimeString() }]);
   };
 
   const handleManualInput = (e) => {
     if (e.key === 'Enter' && e.target.value.trim()) {
-      const text = e.target.value;
-      addTranscript('You', text);
-      socketRef.current?.emit('transcript', { 
-        speaker: 'user', 
-        text,
-        timestamp: Date.now()
-      });
+      addTranscript('You', e.target.value);
+      socketRef.current?.emit('transcript', { speaker: 'user', text: e.target.value, timestamp: Date.now(), roomId: currentRoomId });
       e.target.value = '';
     }
   };
 
   const triggerAnalysis = () => {
-    const recentTranscript = transcript.slice(-5).map(t => `${t.speaker}: ${t.text}`).join('\n');
-    socketRef.current?.emit('analyze-context', { 
-      transcript: recentTranscript
-    });
-    setAiSuggestion('🔍 Analyzing...');
+    const recent = transcript.slice(-5).map(t => `${t.speaker}: ${t.text}`).join('\n');
+    socketRef.current?.emit('analyze-context', { transcript: recent, roomId: currentRoomId });
+    setAiSuggestion('🔍 Gemini is analyzing context...');
   };
 
+<<<<<<< HEAD
   // Auto-scroll transcript to bottom when new messages arrive
   useEffect(() => {
     if (transcriptFeedRef.current) {
       transcriptFeedRef.current.scrollTop = transcriptFeedRef.current.scrollHeight;
     }
+=======
+  // Auto-scroll transcript
+  useEffect(() => {
+    if (transcriptFeedRef.current) transcriptFeedRef.current.scrollTop = transcriptFeedRef.current.scrollHeight;
+>>>>>>> c687ba6 (important changes)
   }, [transcript]);
 
-  // Status Component
-  const StatusDot = () => {
-    const statusConfig = {
-      offline: { color: 'bg-red-500', text: 'Offline' },
-      connecting: { color: 'bg-yellow-500', text: 'Connecting' },
-      online: { color: 'bg-blue-500', text: 'Online' },
-      connected: { color: 'bg-green-500', text: 'Live' },
-      error: { color: 'bg-red-500', text: 'Error' }
-    };
-    
-    const config = statusConfig[connectionStatus] || statusConfig.offline;
-    
-    return (
-      <div className="flex items-center gap-2 text-xs font-mono text-gray-400 bg-gray-800/50 px-3 py-1 rounded-full">
-        <span className={`w-2 h-2 rounded-full ${config.color} ${connectionStatus === 'connecting' ? 'animate-pulse' : ''}`}></span>
-        <span>{config.text}</span>
-      </div>
-    );
-  };
-
-  // Metric Bar
-  const MetricBar = ({ label, value, max, color }) => (
-    <div className="mb-2">
-      <div className="flex justify-between text-xs mb-1">
-        <span className="text-gray-400">{label}</span>
-        <span className="text-gray-300 font-mono">{value}{max ? `/${max}` : ''}</span>
-      </div>
-      <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
-        <div 
-          className={`h-full ${color} rounded-full transition-all duration-500`}
-          style={{ width: `${max ? (value/max)*100 : value}%` }}
-        />
-      </div>
-    </div>
-  );
-
+  // --- RENDER UI ---
   return (
+<<<<<<< HEAD
     <div className="bg-gray-900 text-gray-100 h-screen overflow-hidden flex flex-col">
       {/* Navbar */}
       <nav className="h-16 bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 md:px-6 z-50 flex-shrink-0">
+=======
+    <div className="bg-gray-900 text-gray-100 h-screen w-screen overflow-hidden flex flex-col font-sans">
+      
+      {/* NAVBAR */}
+      <nav className="h-16 bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 md:px-6 flex-shrink-0 z-50">
+>>>>>>> c687ba6 (important changes)
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center shadow-lg shadow-indigo-500/30">
+          <div className="w-8 h-8 bg-indigo-600 rounded flex items-center justify-center">
             <Mic className="w-4 h-4 text-white" />
           </div>
-          <h1 className="font-bold text-lg tracking-wide hidden md:block">
-            InsightEngine <span className="text-xs font-normal text-gray-500">Voice Coach</span>
-          </h1>
-          <h1 className="font-bold text-lg tracking-wide md:hidden">
-            IE <span className="text-xs font-normal text-gray-500">Voice</span>
-          </h1>
+          <h1 className="font-bold text-lg hidden md:block">InsightEngine <span className="text-xs font-normal text-gray-500">Voice</span></h1>
         </div>
-        
         <div className="flex items-center gap-4">
-          <StatusDot />
-          {isConnected && (
-            <>
-              <button 
-                onClick={toggleMute}
-                className={`${isMuted ? 'bg-red-600/20 text-red-400 border-red-600/50' : 'bg-gray-700 text-gray-300 border-gray-600'} hover:bg-opacity-80 px-3 py-1.5 rounded text-sm transition border flex items-center gap-2`}
-              >
-                {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                <span className="hidden sm:inline">{isMuted ? 'Unmute' : 'Mute'}</span>
+           <div className={`w-2 h-2 rounded-full ${connectionStatus === 'online' || connectionStatus === 'connected' ? 'bg-green-500' : 'bg-red-500'}`} />
+           {isConnected && (
+            <div className="flex gap-2">
+              <button onClick={toggleMute} className="px-3 py-1 bg-gray-800 rounded border border-gray-700 text-sm flex items-center gap-2">
+                {isMuted ? <MicOff className="w-3 h-3"/> : <Mic className="w-3 h-3"/>}
+                {isMuted ? 'Unmute' : 'Mute'}
               </button>
-              <button 
-                onClick={stopSession}
-                className="bg-red-600/20 text-red-400 hover:bg-red-600 hover:text-white px-4 py-1.5 rounded text-sm transition border border-red-600/50 flex items-center gap-2"
-              >
-                <PhoneOff className="w-4 h-4" />
-                <span className="hidden sm:inline">End</span>
+              <button onClick={stopSession} className="px-3 py-1 bg-red-900/50 text-red-200 rounded border border-red-900 text-sm flex items-center gap-2">
+                <PhoneOff className="w-3 h-3"/> End
               </button>
-            </>
-          )}
+            </div>
+           )}
         </div>
       </nav>
 
+ HEAD
       {/* Lobby Screen */}
       {isInLobby && (
         <div className="absolute inset-0 top-16 z-50 bg-gray-900 flex flex-col items-center justify-center p-4">
@@ -602,63 +416,83 @@ const InsightEngineApp = () => {
                   <div className="text-yellow-400 text-sm animate-bounce">😏 Sarcasm Detected!</div>
                 )}
               </div>
+      {/* MAIN LAYOUT GRID */}
+      <div className="flex-1 flex flex-col md:grid md:grid-cols-[1fr_400px] min-h-0 overflow-hidden relative">
+        
+        {/* LOBBY OVERLAY */}
+        {isInLobby && (
+          <div className="absolute inset-0 z-40 bg-gray-900 flex flex-col items-center justify-center p-4">
+             <div className="w-20 h-20 bg-gray-800 rounded-full flex items-center justify-center border border-gray-700 mb-8">
+                <Volume2 className="w-8 h-8 text-indigo-500" />
+             </div>
+             <h2 className="text-3xl font-bold mb-2">Voice Sales Coach</h2>
+             <button 
+               onClick={startMatchmaking}
+               disabled={connectionStatus === 'offline'}
+               className="bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-3 rounded-xl font-bold transition-all disabled:opacity-50"
+             >
+               {connectionStatus === 'offline' ? 'Connecting...' : 'Start Session'}
+             </button>
+          </div>
+        )}
+ c687ba6 (important changes)
 
-              {/* Voice Analytics Grid */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div className="bg-gray-800/50 backdrop-blur-md p-4 rounded-xl border border-gray-700/50">
-                  <div className="text-xs text-gray-400 mb-2">Confidence</div>
-                  <div className="text-2xl font-bold text-white">{Math.round(voiceAnalytics.confidence_score)}%</div>
-                  <div className="h-1 bg-gray-700 rounded-full mt-2 overflow-hidden">
-                    <div className="h-full bg-indigo-500 rounded-full transition-all" style={{ width: `${voiceAnalytics.confidence_score}%` }}></div>
-                  </div>
+        {/* LEFT PANEL: METRICS & WARNINGS */}
+        <div className="bg-gradient-to-br from-gray-900 to-indigo-950 relative flex flex-col items-center justify-center p-6 overflow-hidden">
+           {isConnected && (
+             <div className="w-full max-w-2xl space-y-8 animate-fade-in text-center">
+                
+                <div className="relative inline-block">
+                  <div className="absolute inset-0 bg-indigo-500 blur-3xl opacity-20 animate-pulse" />
+                  <Volume2 className={`w-24 h-24 mx-auto ${isMuted ? 'text-gray-600' : 'text-indigo-400'}`} />
                 </div>
                 
-                <div className="bg-gray-800/50 backdrop-blur-md p-4 rounded-xl border border-gray-700/50">
-                  <div className="text-xs text-gray-400 mb-2">Speaking Rate</div>
-                  <div className="text-2xl font-bold text-white">{voiceMetrics.wpm}</div>
-                  <div className="text-xs text-gray-500 mt-1">words/min</div>
-                </div>
+                <h2 className="text-2xl font-bold">Analysis Active</h2>
                 
-                <div className="bg-gray-800/50 backdrop-blur-md p-4 rounded-xl border border-gray-700/50">
-                  <div className="text-xs text-gray-400 mb-2">Emotion</div>
-                  <div className="text-lg font-bold text-white truncate capitalize">{dominantEmotion}</div>
+                {/* DYNAMIC WARNINGS (Sarcasm & Eye Tracking) */}
+                <div className="h-10 flex items-center justify-center flex-col gap-2">
+                  {sarcasmDetected && <div className="text-yellow-400 font-bold animate-bounce text-sm">⚠️ Sarcasm Detected</div>}
+                  {isLookingAway && (
+                    <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-1.5 rounded-lg font-bold animate-pulse text-sm">
+                      👀 Prospect is looking away! Re-engage them.
+                    </div>
+                  )}
                 </div>
-                
-                <div className="bg-gray-800/50 backdrop-blur-md p-4 rounded-xl border border-gray-700/50">
-                  <div className="text-xs text-gray-400 mb-2">Pauses</div>
-                  <div className="text-2xl font-bold text-white">{voiceMetrics.pauses_count}</div>
-                </div>
-              </div>
 
-              {/* Detailed Voice Metrics */}
-              <div className="max-w-2xl mx-auto bg-gray-800/30 backdrop-blur-md p-5 rounded-xl border border-gray-700/50">
-                <h3 className="text-xs text-gray-400 font-bold mb-3 uppercase">Voice Quality Metrics</h3>
-                <MetricBar label="Pitch Stability" value={voiceAnalytics.pitch_stability} max={100} color="bg-blue-500" />
-                <MetricBar label="Volume Stability" value={voiceAnalytics.volume_stability} max={100} color="bg-green-500" />
-                <div className="grid grid-cols-2 gap-4 mt-3 text-xs">
-                  <div>
-                    <span className="text-gray-400">Avg Pitch:</span>
-                    <span className="text-gray-300 ml-2">{Math.round(voiceAnalytics.avg_pitch_hz)} Hz</span>
-                  </div>
-                  <div>
-                    <span className="text-gray-400">Total Words:</span>
-                    <span className="text-gray-300 ml-2">{voiceMetrics.total_words}</span>
-                  </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6">
+                   <div className="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50">
+                      <div className="text-gray-400 text-xs mb-1">Confidence</div>
+                      <div className="text-xl font-bold">{Math.round(voiceAnalytics.confidence_score)}%</div>
+                   </div>
+                   <div className="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50">
+                      <div className="text-gray-400 text-xs mb-1">Emotion</div>
+                      <div className="text-xl font-bold capitalize">{dominantEmotion}</div>
+                   </div>
+                   <div className="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50">
+                      <div className="text-gray-400 text-xs mb-1">Rate</div>
+                      <div className="text-xl font-bold">{Math.round(voiceMetrics.wpm)} wpm</div>
+                   </div>
+                   <div className="bg-gray-800/40 p-4 rounded-xl border border-gray-700/50">
+                      <div className="text-gray-400 text-xs mb-1">Pauses</div>
+                      <div className="text-xl font-bold">{voiceMetrics.pauses_count}</div>
+                   </div>
                 </div>
-              </div>
-            </div>
-          )}
 
-          {isWaiting && (
-            <div className="text-center">
-              <div className="w-8 h-8 border-3 border-gray-300 border-t-indigo-500 rounded-full animate-spin mb-4 mx-auto" />
-              <p className="text-indigo-200 animate-pulse font-medium mb-2">Initializing voice AI...</p>
-              <p className="text-gray-500 text-sm">Loading analysis models</p>
-              <button onClick={stopSession} className="mt-8 text-xs text-gray-500 hover:text-gray-300 underline">Cancel</button>
-            </div>
-          )}
+                <div className="bg-gray-800/30 p-6 rounded-xl border border-gray-700/50 text-left">
+                   <MetricBar label="Pitch Stability" value={voiceAnalytics.pitch_stability} max={100} color="bg-blue-500" />
+                   <MetricBar label="Volume Stability" value={voiceAnalytics.volume_stability} max={100} color="bg-green-500" />
+                </div>
+             </div>
+           )}
+           {isWaiting && (
+             <div className="text-center animate-pulse">
+               <div className="w-12 h-12 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+               <p className="text-indigo-200">Initializing AI Models...</p>
+             </div>
+           )}
         </div>
 
+ HEAD
         {/* Sidebar - FIXED HEIGHT AND OVERFLOW */}
         <div className="bg-gray-900/95 backdrop-blur-md border-l border-gray-800 flex flex-col h-full overflow-hidden">
           
@@ -750,19 +584,66 @@ const InsightEngineApp = () => {
                     <div className="w-3 h-3 border-2 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin" />
                     {isConnected ? 'Monitoring voice patterns...' : 'AI coach activates during session'}
                   </div>
-                )}
-              </div>
-            </div>
+        {/* RIGHT PANEL: TRANSCRIPT & COACH */}
+        <div className="bg-gray-900/95 border-l border-gray-800 flex flex-col h-full overflow-hidden">
+          
+          <div className="p-3 border-b border-gray-700 bg-gray-800/50 flex-shrink-0 flex justify-between items-center">
+             <span className="text-xs font-bold text-gray-400 uppercase flex items-center gap-2"><AlignLeft className="w-3 h-3" /> Live Transcript</span>
+             {isConnected && <span className="text-xs text-red-400 animate-pulse">● REC</span>}
           </div>
+
+          <div ref={transcriptFeedRef} className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0" style={{ scrollBehavior: 'smooth' }}>
+             {transcript.length === 0 ? (
+               <div className="text-center text-gray-600 text-xs mt-10 italic">Conversation will appear here...</div>
+             ) : (
+               transcript.map((t) => (
+                 <div key={t.id} className="text-sm animate-fade-in">
+                    <div className="flex gap-2 mb-1 items-baseline">
+                       <span className={`font-bold text-xs ${t.speaker === 'You' ? 'text-indigo-400' : t.speaker === 'AI Coach' ? 'text-green-400' : 'text-blue-400'}`}>
+                         {t.speaker}
+                       </span>
+                       <span className="text-gray-600 text-[10px]">{t.timestamp}</span>
+                    </div>
+                    <p className="text-gray-300 leading-relaxed">{t.text}</p>
+                 </div>
+               ))
+             )}
+          </div>
+
+          {isConnected && (
+            <div className="p-2 border-t border-gray-800 bg-gray-900 flex-shrink-0">
+               <input 
+                 className="w-full bg-gray-800 text-gray-200 text-xs p-2 rounded border border-gray-700 focus:border-indigo-500 outline-none"
+                 placeholder="Type a message..."
+                 onKeyPress={handleManualInput}
+               />
+            </div>
+          )}
+
+          {/* AI COACH WINDOW */}
+          <div className="h-48 min-h-[12rem] border-t border-indigo-500/20 bg-indigo-900/10 flex flex-col flex-shrink-0">
+             <div className="p-3 border-b border-indigo-500/10 bg-indigo-900/20 flex justify-between items-center">
+                <span className="text-xs font-bold text-indigo-300 uppercase flex items-center gap-2"><Bot className="w-3 h-3" /> Gemini Coach</span>
+                {isConnected && (
+                  <button onClick={triggerAnalysis} className="text-[10px] bg-indigo-600 px-2 py-1 rounded text-white hover:bg-indigo-500 flex items-center gap-1 shadow-lg shadow-indigo-500/20">
+                    <Activity className="w-3 h-3" /> Analyze
+                  </button>
+ c687ba6 (important changes)
+                )}
+             </div>
+             <div className="flex-1 p-4 overflow-y-auto">
+                <p className="text-sm text-indigo-100 leading-relaxed">
+                   {aiSuggestion || <span className="text-indigo-400/50 italic">Click Analyze to get interview tips...</span>}
+                </p>
+             </div>
+          </div>
+
         </div>
       </div>
       
       <style>{`
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(5px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
         .animate-fade-in { animation: fadeIn 0.3s ease-out; }
+ HEAD
         
         /* Custom scrollbar for transcript */
         .overflow-y-auto::-webkit-scrollbar {
@@ -778,7 +659,9 @@ const InsightEngineApp = () => {
         }
         .overflow-y-auto::-webkit-scrollbar-thumb:hover {
           background: rgba(107, 114, 128, 1);
-        }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+ c687ba6 (important changes)
       `}</style>
     </div>
   );
